@@ -11,7 +11,7 @@ includedirs {"include", "src", "thirdparty/Vulkan-Headers/include"}
 
 filter "system:windows"
 systemversion "latest"
-defines {"VK_USE_PLATFORM_WIN32_KHR"}
+defines {"VK_USE_PLATFORM_WIN32_KHR", "NOMINMAX"}
 
 filter "configurations:Debug"
 runtime "Debug"
