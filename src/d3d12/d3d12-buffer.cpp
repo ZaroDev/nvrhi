@@ -45,6 +45,13 @@ namespace nvrhi::d3d12
     
     Buffer::~Buffer()
     {
+        if (m_Context.logBufferLifetime)
+        {
+            std::stringstream ss;
+            ss << "Release buffer: " << desc.debugName << " 0x" << std::hex << getGpuVirtualAddress();
+            m_Context.info(ss.str());
+        }
+
         if (m_ClearUAV != c_InvalidDescriptorIndex)
         {
             m_Resources.shaderResourceViewHeap.releaseDescriptor(m_ClearUAV);
@@ -107,6 +114,8 @@ namespace nvrhi::d3d12
             case CpuAccessMode::None:
                 heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
                 initialState = convertResourceStates(d.initialState);
+                if (initialState != D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)
+                    initialState = D3D12_RESOURCE_STATE_COMMON;
                 break;
 
             case CpuAccessMode::Read:
@@ -118,6 +127,15 @@ namespace nvrhi::d3d12
                 heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
                 initialState = D3D12_RESOURCE_STATE_GENERIC_READ;
                 break;
+        }
+
+        // Allow readback buffers to be used as resolve destination targets
+        if ((buffer->desc.cpuAccess == CpuAccessMode::Read) && (d.initialState == ResourceStates::ResolveDest))
+        {
+            heapProps.Type = D3D12_HEAP_TYPE_CUSTOM;
+            heapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+            heapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+            initialState = D3D12_RESOURCE_STATE_COMMON;
         }
 
         HRESULT res = m_Context.device->CreateCommittedResource(
@@ -174,6 +192,46 @@ namespace nvrhi::d3d12
         {
             std::wstring wname(desc.debugName.begin(), desc.debugName.end());
             resource->SetName(wname.c_str());
+#if NVRHI_WITH_AFTERMATH
+            // the driver will track the resource internally so don't need to keep the handle around
+            GFSDK_Aftermath_ResourceHandle resourceHandle = {};
+            GFSDK_Aftermath_DX12_RegisterResource(resource, &resourceHandle);
+#endif
+        }
+
+        if (m_Context.logBufferLifetime)
+        {
+            size_t byteDisplay = desc.byteSize;
+            const char* byteUnit = "B";
+
+            if (desc.byteSize > (1 << 20))
+            {
+                byteDisplay = desc.byteSize >> 20;
+                byteUnit = "MB";
+            }
+            else if (desc.byteSize > (1 << 10))
+            {
+                byteDisplay = desc.byteSize >> 10;
+                byteUnit = "KB";
+            }
+
+            std::stringstream ss;
+            ss << "Create buffer: " << desc.debugName 
+               << " Res:0x" << std::hex << reinterpret_cast<uintptr_t>(resource.Get()) 
+               << " Gpu:0x" << std::hex << getGpuVirtualAddress() << "->0x" << std::hex << getGpuVirtualAddress() + desc.byteSize;
+
+            if (desc.structStride)
+            {
+                ss << " (n:" << std::dec << (desc.structStride ? desc.byteSize / desc.structStride : 0) 
+                   << " stride:" << std::dec << desc.structStride
+                   << "B size:" << std::dec << byteDisplay << byteUnit << ")";
+            }
+            else
+            {
+                ss << " (size:" << std::dec << byteDisplay << byteUnit << ")";
+            }
+    
+            m_Context.info(ss.str());
         }
     }
 
@@ -256,10 +314,14 @@ namespace nvrhi::d3d12
         if (!buffer->desc.isVirtual)
             return false; // not supported
 
+        D3D12_RESOURCE_STATES initialState = convertResourceStates(buffer->desc.initialState);
+        if (initialState != D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)
+            initialState = D3D12_RESOURCE_STATE_COMMON;
+
         HRESULT hr = m_Context.device->CreatePlacedResource(
             heap->heap, offset,
             &buffer->resourceDesc,
-            convertResourceStates(buffer->desc.initialState),
+            initialState,
             nullptr,
             IID_PPV_ARGS(&buffer->resource));
 

@@ -64,13 +64,43 @@ namespace nvrhi::d3d11
                 m_SinglePassStereoSupported = true;
             }
 
+            // There is no query for HLSL extension UAV support, so query support for the oldest instruction available.
+            bool supported = false;
+            if (NvAPI_D3D11_IsNvShaderExtnOpCodeSupported(m_Context.device, NV_EXTN_OP_SHFL, &supported) == NVAPI_OK && supported)
+            {
+                m_HlslExtensionsSupported = true;
+            }
+
             // There is no query for FastGS, so query support for FP16 atomics as a proxy.
             // Both features were introduced in the same architecture (Maxwell).
-            bool supported = false;
+            supported = false;
             if (NvAPI_D3D11_IsNvShaderExtnOpCodeSupported(m_Context.device, NV_EXTN_OP_FP16_ATOMIC, &supported) == NVAPI_OK && supported)
             {
                 m_FastGeometryShaderSupported = true;
             }
+        }
+#endif
+
+#if NVRHI_WITH_AFTERMATH
+        if (desc.aftermathEnabled)
+        {
+            auto CheckAftermathResult = [this](GFSDK_Aftermath_Result result)
+            {
+                if (!GFSDK_Aftermath_SUCCEED(result))
+                {
+                    std::stringstream ss;
+                    ss << "Aftermath initialize call failed, result = 0x" << std::hex << std::setw(8) << result;
+                    m_Context.error(ss.str());
+                    return false;
+                }
+                return true;
+            };
+            const uint32_t aftermathFlags = GFSDK_Aftermath_FeatureFlags_EnableMarkers | GFSDK_Aftermath_FeatureFlags_EnableResourceTracking | GFSDK_Aftermath_FeatureFlags_GenerateShaderDebugInfo | GFSDK_Aftermath_FeatureFlags_EnableShaderErrorReporting;
+            bool success = CheckAftermathResult(GFSDK_Aftermath_DX11_Initialize(GFSDK_Aftermath_Version_API, aftermathFlags, m_Context.device));
+            if (success)
+                success = CheckAftermathResult(GFSDK_Aftermath_DX11_CreateContextHandle(m_Context.immediateContext, &m_Context.aftermathContext));
+            if (success)
+                m_AftermathEnabled = true;
         }
 #endif
 
@@ -89,6 +119,21 @@ namespace nvrhi::d3d11
         }
 
         m_ImmediateCommandList = CommandListHandle::Create(new CommandList(m_Context, this, CommandListParameters()));   
+    }
+
+    Device::~Device()
+    {
+        // Release the command list so that it unregisters the Aftermath marker tracker before the device is destroyed
+        m_ImmediateCommandList = nullptr;
+
+#if NVRHI_WITH_AFTERMATH
+        if (m_Context.aftermathContext)
+        {
+            GFSDK_Aftermath_ReleaseContextHandle(m_Context.aftermathContext);
+            m_Context.aftermathContext = nullptr;
+        }
+        m_AftermathEnabled = false;
+#endif
     }
 
     GraphicsAPI Device::getGraphicsAPI()
@@ -134,6 +179,49 @@ namespace nvrhi::d3d11
         return m_ImmediateCommandList;
     }
 
+    void Device::getTextureTiling(ITexture* texture, uint32_t* numTiles, PackedMipDesc* desc, TileShape* tileShape, uint32_t* subresourceTilingsNum, SubresourceTiling* subresourceTilings)
+    {
+        (void)texture;
+        (void)numTiles;
+        (void)desc;
+        (void)tileShape;
+        (void)subresourceTilingsNum;
+        (void)subresourceTilings;
+
+        utils::NotSupported();
+    }
+
+    void Device::updateTextureTileMappings(ITexture* texture, const TextureTilesMapping* tileMappings, uint32_t numTileMappings, CommandQueue executionQueue)
+    {
+        (void)texture;
+        (void)tileMappings;
+        (void)numTileMappings;
+        (void)executionQueue;
+
+        utils::NotSupported();
+    }
+
+    SamplerFeedbackTextureHandle Device::createSamplerFeedbackTexture(ITexture* pairedTexture, const SamplerFeedbackTextureDesc& desc)
+    {
+        (void)pairedTexture;
+        (void)desc;
+
+        utils::NotSupported();
+
+        return nullptr;
+    }
+
+    SamplerFeedbackTextureHandle Device::createSamplerFeedbackForNativeTexture(ObjectType objectType, Object texture, ITexture* pairedTexture)
+    {
+        (void)objectType;
+        (void)texture;
+        (void)pairedTexture;
+
+        utils::NotSupported();
+
+        return nullptr;
+    }
+
     bool Device::queryFeatureSupport(Feature feature, void* pInfo, size_t infoSize)
     {
         (void)pInfo;
@@ -155,6 +243,8 @@ namespace nvrhi::d3d11
 #endif
         case Feature::ConstantBufferRanges:
             return m_Context.immediateContext1 != nullptr;
+        case Feature::HlslExtensionUAV:
+            return m_HlslExtensionsSupported;
         default:
             return false;
         }
@@ -232,6 +322,12 @@ namespace nvrhi::d3d11
         return MemoryRequirements();
     }
 
+    rt::cluster::OperationSizeInfo Device::getClusterOperationSizeInfo(const rt::cluster::OperationParams&)
+    {
+        utils::NotSupported();
+        return rt::cluster::OperationSizeInfo();
+    }
+
     bool Device::bindAccelStructMemory(rt::IAccelStruct*, IHeap*, uint64_t)
     {
         utils::NotSupported();
@@ -243,7 +339,7 @@ namespace nvrhi::d3d11
         return nullptr;
     }
 
-    void Device::waitForIdle()
+    bool Device::waitForIdle()
     {
         if (!m_WaitForIdleQuery)
         {
@@ -251,11 +347,12 @@ namespace nvrhi::d3d11
         }
 
         if (!m_WaitForIdleQuery)
-            return;
+            return false;
 
         setEventQuery(m_WaitForIdleQuery, CommandQueue::Graphics);
         waitEventQuery(m_WaitForIdleQuery);
         resetEventQuery(m_WaitForIdleQuery);
+        return true;
     }
 
     SamplerHandle Device::createSampler(const SamplerDesc& d)

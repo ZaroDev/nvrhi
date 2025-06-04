@@ -73,13 +73,14 @@ namespace nvrhi::utils
         nvrhi::BindingLayoutHandle& bindingLayout,
         nvrhi::BindingSetHandle& bindingSet)
     {
-        auto convertSetToLayout = [](const BindingSetItemArray& setDesc, BindingLayoutItemArray& layoutDesc)
+        auto convertSetToLayout = [](const std::vector<BindingSetItem>& setDesc, std::vector<BindingLayoutItem>& layoutDesc)
         {
             for (auto& item : setDesc)
             {
                 BindingLayoutItem layoutItem{};
                 layoutItem.slot = item.slot;
                 layoutItem.type = item.type;
+                layoutItem.size = 1;
                 if (item.type == ResourceType::PushConstants)
                     layoutItem.size = uint32_t(item.range.byteSize);
                 layoutDesc.push_back(layoutItem);
@@ -124,7 +125,9 @@ namespace nvrhi::utils
         const FramebufferAttachment& att = framebuffer->getDesc().depthAttachment;
         if (att.texture)
         {
-            commandList->clearTextureFloat(att.texture, att.subresources, Color(depth, float(stencil), 0.f, 0.f));
+            const FormatInfo& formatInfo = getFormatInfo(att.texture->getDesc().format);
+            commandList->clearDepthStencilTexture(att.texture, att.subresources, formatInfo.hasDepth, depth,
+                formatInfo.hasStencil, uint8_t(stencil));
         }
     }
 

@@ -210,7 +210,10 @@ namespace nvrhi::vulkan
             flags |= vk::ImageCreateFlagBits::eCubeCompatible;
 
         if (d.isTypeless)
-            flags |= vk::ImageCreateFlagBits::eMutableFormat;
+            flags |= vk::ImageCreateFlagBits::eMutableFormat | vk::ImageCreateFlagBits::eExtendedUsage;
+
+        if (d.isTiled)
+            flags |= vk::ImageCreateFlagBits::eSparseBinding | vk::ImageCreateFlagBits::eSparseResidency;
 
         return flags;
     }
@@ -254,7 +257,7 @@ namespace nvrhi::vulkan
     }
 
     TextureSubresourceView& Texture::getSubresourceView(const TextureSubresourceSet& subresource, TextureDimension dimension,
-        Format format, TextureSubresourceViewType viewtype)
+        Format format, vk::ImageUsageFlags usage, TextureSubresourceViewType viewtype)
     {
         // This function is called from createBindingSet etc. and therefore free-threaded.
         // It modifies the subresourceViews map associated with the texture.
@@ -266,7 +269,12 @@ namespace nvrhi::vulkan
         if (format == Format::UNKNOWN)
             format = desc.format;
 
-        auto cachekey = std::make_tuple(subresource, viewtype, dimension, format);
+        // Only use VkImageViewUsageCreateInfo when the image is typeless, i.e. it was created
+        // with the MUTABLE_FORMAT and EXTENDED_USAGE bits.
+        if (!desc.isTypeless)
+            usage = vk::ImageUsageFlags(0);
+
+        auto cachekey = std::make_tuple(subresource, viewtype, dimension, format, usage);
         auto iter = subresourceViews.find(cachekey);
         if (iter != subresourceViews.end())
         {
@@ -291,10 +299,16 @@ namespace nvrhi::vulkan
         vk::ImageViewType imageViewType = textureDimensionToImageViewType(dimension);
 
         auto viewInfo = vk::ImageViewCreateInfo()
-                            .setImage(image)
-                            .setViewType(imageViewType)
-                            .setFormat(vk::Format(vkformat))
-                            .setSubresourceRange(view.subresourceRange);
+                        .setImage(image)
+                        .setViewType(imageViewType)
+                        .setFormat(vk::Format(vkformat))
+                        .setSubresourceRange(view.subresourceRange);
+
+        auto usageInfo = vk::ImageViewUsageCreateInfo()
+                        .setUsage(usage);
+
+        if (uint32_t(usage) != 0)
+            viewInfo.setPNext(&usageInfo);
 
         if (viewtype == TextureSubresourceViewType::StencilOnly)
         {
@@ -307,7 +321,7 @@ namespace nvrhi::vulkan
         ASSERT_VK_OK(res);
 
         const std::string debugName = std::string("ImageView for: ") + utils::DebugNameToString(desc.debugName);
-        m_Context.nameVKObject(VkImageView(view.view), vk::DebugReportObjectTypeEXT::eImageView, debugName.c_str());
+        m_Context.nameVKObject(VkImageView(view.view), vk::ObjectType::eImageView, vk::DebugReportObjectTypeEXT::eImageView, debugName.c_str());
 
         return view;
     }
@@ -322,7 +336,7 @@ namespace nvrhi::vulkan
         ASSERT_VK_OK(res);
         CHECK_VK_FAIL(res)
 
-        m_Context.nameVKObject(texture->image, vk::DebugReportObjectTypeEXT::eImage, desc.debugName.c_str());
+        m_Context.nameVKObject(texture->image, vk::ObjectType::eImage, vk::DebugReportObjectTypeEXT::eImage, desc.debugName.c_str());
 
         if (!desc.isVirtual)
         {
@@ -339,7 +353,7 @@ namespace nvrhi::vulkan
 #endif
             }
 
-            m_Context.nameVKObject(texture->memory, vk::DebugReportObjectTypeEXT::eDeviceMemory, desc.debugName.c_str());
+            m_Context.nameVKObject(texture->memory, vk::ObjectType::eDeviceMemory, vk::DebugReportObjectTypeEXT::eDeviceMemory, desc.debugName.c_str());
         }
 
         return TextureHandle::Create(texture);
@@ -471,7 +485,7 @@ namespace nvrhi::vulkan
         uint32_t deviceNumCols = (mipWidth + formatInfo.blockSize - 1) / formatInfo.blockSize;
         uint32_t deviceNumRows = (mipHeight + formatInfo.blockSize - 1) / formatInfo.blockSize;
         uint32_t deviceRowPitch = deviceNumCols * formatInfo.bytesPerBlock;
-        uint32_t deviceMemSize = deviceRowPitch * deviceNumRows * mipDepth;
+        uint64_t deviceMemSize = uint64_t(deviceRowPitch) * uint64_t(deviceNumRows) * mipDepth;
 
         Buffer* uploadBuffer;
         uint64_t uploadOffset;
@@ -655,6 +669,30 @@ namespace nvrhi::vulkan
         clearTexture(texture, subresources, clearValue);
     }
 
+    void CommandList::clearSamplerFeedbackTexture(ISamplerFeedbackTexture* texture)
+    {
+        (void)texture;
+
+        utils::NotSupported();
+    }
+
+    void CommandList::decodeSamplerFeedbackTexture(IBuffer* buffer, ISamplerFeedbackTexture* texture, nvrhi::Format format)
+    {
+        (void)buffer;
+        (void)texture;
+        (void)format;
+
+        utils::NotSupported();
+    }
+
+    void CommandList::setSamplerFeedbackTextureState(ISamplerFeedbackTexture* texture, ResourceStates stateBits)
+    {
+        (void)texture;
+        (void)stateBits;
+
+        utils::NotSupported();
+    }
+
     Object Texture::getNativeObject(ObjectType objectType)
     {
         switch (objectType)
@@ -665,6 +703,8 @@ namespace nvrhi::vulkan
             return Object(memory);
         case ObjectTypes::SharedHandle:
             return Object(sharedHandle);
+        case ObjectTypes::VK_ImageCreateInfo:
+            return Object(&imageInfo);
         default:
             return nullptr;
         }
@@ -687,7 +727,8 @@ namespace nvrhi::vulkan
             else if(!formatInfo.hasDepth && formatInfo.hasStencil)
                 viewType = TextureSubresourceViewType::StencilOnly;
 
-            return Object(getSubresourceView(subresources, dimension, format, viewType).view);
+            // Note: we don't have the intended usage information here, so VkImageViewUsageCreateInfo won't be added to the view.
+            return Object(getSubresourceView(subresources, dimension, format, vk::ImageUsageFlags(0), viewType).view);
         }
         default:
             return nullptr;

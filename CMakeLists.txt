@@ -36,6 +36,7 @@ cmake_dependent_option(NVRHI_INSTALL_EXPORTS "Install CMake exports" OFF "NVRHI_
 option(NVRHI_WITH_VALIDATION "Build NVRHI the validation layer" ON)
 option(NVRHI_WITH_VULKAN "Build the NVRHI Vulkan backend" ON)
 option(NVRHI_WITH_RTXMU "Use RTXMU for acceleration structure management" OFF)
+option(NVRHI_WITH_AFTERMATH "Include Aftermath support (requires NSight Aftermath SDK)" OFF)
 
 cmake_dependent_option(NVRHI_WITH_NVAPI "Include NVAPI support (requires NVAPI SDK)" OFF "WIN32" OFF)
 cmake_dependent_option(NVRHI_WITH_DX11 "Build the NVRHI D3D11 backend" ON "WIN32" OFF)
@@ -55,6 +56,10 @@ set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
 if (NVRHI_WITH_VULKAN AND NOT TARGET Vulkan-Headers AND NOT TARGET Vulkan::Headers)
     add_subdirectory(thirdparty/Vulkan-Headers)
+endif()
+
+if(NVRHI_WITH_DX12 AND NOT TARGET DirectX-Headers AND NOT TARGET Microsoft::DirectX-Headers)
+    add_subdirectory(thirdparty/DirectX-Headers)
 endif()
 
 if (NVRHI_WITH_RTXMU)
@@ -80,19 +85,25 @@ if (NVRHI_WITH_NVAPI AND NOT TARGET nvapi)
     endif()
 endif()
 
+if (NVRHI_WITH_AFTERMATH AND NOT TARGET aftermath)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/FetchAftermath.cmake")
+endif()
 
 set(include_common
     include/nvrhi/nvrhi.h
+    include/nvrhi/nvrhiHLSL.h
     include/nvrhi/utils.h
     include/nvrhi/common/containers.h
     include/nvrhi/common/misc.h
-    include/nvrhi/common/resource.h)
+    include/nvrhi/common/resource.h
+    include/nvrhi/common/aftermath.h)
 set(src_common
     src/common/format-info.cpp
     src/common/misc.cpp
     src/common/state-tracking.cpp
     src/common/state-tracking.h
-    src/common/utils.cpp)
+    src/common/utils.cpp
+    src/common/aftermath.cpp)
 
 if(MSVC)
     set(misc_common 
@@ -106,9 +117,7 @@ set(include_validation
 set(src_validation
     src/validation/validation-commandlist.cpp
     src/validation/validation-device.cpp
-    src/validation/validation-backend.h
-    src/common/sparse-bitset.h
-    src/common/sparse-bitset.cpp)
+    src/validation/validation-backend.h)
 
 set(include_d3d11
     include/nvrhi/d3d11.h)
@@ -208,6 +217,8 @@ target_include_directories(nvrhi PUBLIC
 
 set_target_properties(nvrhi PROPERTIES FOLDER "NVRHI")
 
+target_compile_definitions(nvrhi PRIVATE NVRHI_WITH_AFTERMATH=$<BOOL:${NVRHI_WITH_AFTERMATH}>)
+
 # implementations
 
 if (NVRHI_WITH_DX11)
@@ -232,10 +243,13 @@ if (NVRHI_WITH_DX11)
 
     if (NVRHI_WITH_NVAPI)
         target_link_libraries(${nvrhi_d3d11_target} PUBLIC nvapi)
-        target_compile_definitions(${nvrhi_d3d11_target} PRIVATE NVRHI_D3D11_WITH_NVAPI=1)
-    else()
-        target_compile_definitions(${nvrhi_d3d11_target} PRIVATE NVRHI_D3D11_WITH_NVAPI=0)
     endif()
+    target_compile_definitions(${nvrhi_d3d11_target} PRIVATE NVRHI_D3D11_WITH_NVAPI=$<BOOL:${NVRHI_WITH_NVAPI}>)
+
+    if (NVRHI_WITH_AFTERMATH)
+        target_link_libraries(${nvrhi_d3d11_target} PUBLIC aftermath)
+    endif()
+    target_compile_definitions(${nvrhi_d3d11_target} PRIVATE NVRHI_WITH_AFTERMATH=$<BOOL:${NVRHI_WITH_AFTERMATH}>)
 endif()
 
 if (NVRHI_WITH_DX12)
@@ -261,14 +275,17 @@ if (NVRHI_WITH_DX12)
         target_link_libraries(${nvrhi_d3d12_target} PUBLIC rtxmu)
     endif()
 
-    target_link_libraries(${nvrhi_d3d12_target} PUBLIC d3d12 dxguid)
+    target_link_libraries(${nvrhi_d3d12_target} PUBLIC Microsoft::DirectX-Headers Microsoft::DirectX-Guids d3d12)
 
     if (NVRHI_WITH_NVAPI)
         target_link_libraries(${nvrhi_d3d12_target} PUBLIC nvapi)
-        target_compile_definitions(${nvrhi_d3d12_target} PRIVATE NVRHI_D3D12_WITH_NVAPI=1)
-    else()
-        target_compile_definitions(${nvrhi_d3d12_target} PRIVATE NVRHI_D3D12_WITH_NVAPI=0)
     endif()
+    target_compile_definitions(${nvrhi_d3d12_target} PRIVATE NVRHI_D3D12_WITH_NVAPI=$<BOOL:${NVRHI_WITH_NVAPI}>)
+
+    if (NVRHI_WITH_AFTERMATH)
+        target_link_libraries(${nvrhi_d3d12_target} PUBLIC aftermath)
+    endif()
+    target_compile_definitions(${nvrhi_d3d12_target} PRIVATE NVRHI_WITH_AFTERMATH=$<BOOL:${NVRHI_WITH_AFTERMATH}>)
 endif()
 
 if (NVRHI_WITH_VULKAN)
@@ -305,6 +322,10 @@ if (NVRHI_WITH_VULKAN)
         target_link_libraries(${nvrhi_vulkan_target} PRIVATE Vulkan::Headers)
     endif()
 
+    if (NVRHI_WITH_AFTERMATH)
+        target_link_libraries(${nvrhi_vulkan_target} PUBLIC aftermath)
+    endif()
+    target_compile_definitions(${nvrhi_vulkan_target} PRIVATE NVRHI_WITH_AFTERMATH=$<BOOL:${NVRHI_WITH_AFTERMATH}>)
 endif()
 
 

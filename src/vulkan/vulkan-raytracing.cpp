@@ -22,6 +22,7 @@
 
 #include "vulkan-backend.h"
 #include <nvrhi/common/misc.h>
+#include <sstream>
 
 namespace nvrhi::vulkan
 {
@@ -177,7 +178,7 @@ namespace nvrhi::vulkan
 
         m_Context.device.getMicromapBuildSizesEXT(vk::AccelerationStructureBuildTypeKHR::eDevice, &buildInfo, &buildSize);
 
-        OpacityMicromap* om = new OpacityMicromap(m_Context);
+        OpacityMicromap* om = new OpacityMicromap();
         om->desc = desc;
         om->compacted = false;
         
@@ -290,7 +291,17 @@ namespace nvrhi::vulkan
             static_assert(offsetof(rt::GeometryTriangles, vertexBuffer)
                 == offsetof(rt::GeometryAABBs, unused));
 
-            // Clear only the triangles' data, because the AABBs' data is aliased to triangles (verified above)
+            static_assert(offsetof(rt::GeometryTriangles, indexBuffer)
+                == offsetof(rt::GeometrySpheres, indexBuffer));
+            static_assert(offsetof(rt::GeometryTriangles, vertexBuffer)
+                == offsetof(rt::GeometrySpheres, vertexBuffer));
+
+            static_assert(offsetof(rt::GeometryTriangles, indexBuffer)
+                == offsetof(rt::GeometryLss, indexBuffer));
+            static_assert(offsetof(rt::GeometryTriangles, vertexBuffer)
+                == offsetof(rt::GeometryLss, vertexBuffer));
+
+            // Clear only the triangles' data, because the other types' data is aliased to triangles (verified above)
             geometry.geometryData.triangles.indexBuffer = nullptr;
             geometry.geometryData.triangles.vertexBuffer = nullptr;
         }
@@ -306,6 +317,12 @@ namespace nvrhi::vulkan
             return getBufferMemoryRequirements(as->dataBuffer);
 
         return MemoryRequirements();
+    }
+
+    rt::cluster::OperationSizeInfo Device::getClusterOperationSizeInfo(const rt::cluster::OperationParams&)
+    {
+        utils::NotSupported();
+        return rt::cluster::OperationSizeInfo();
     }
 
     bool Device::bindAccelStructMemory(rt::IAccelStruct* _as, IHeap* heap, uint64_t offset)
@@ -738,6 +755,11 @@ namespace nvrhi::vulkan
             m_CurrentCmdBuf->referencedResources.push_back(as);
     }
 
+    void CommandList::executeMultiIndirectClusterOperation(const rt::cluster::OperationDesc&)
+    {
+        utils::NotSupported();
+    }
+
     AccelStruct::~AccelStruct()
     {
 #ifdef NVRHI_WITH_RTXMU
@@ -827,7 +849,7 @@ namespace nvrhi::vulkan
         {
             for (size_t i = 0; i < state.bindings.size() && i < pso->desc.globalBindingLayouts.size(); i++)
             {
-                BindingLayout* layout = pso->pipelineBindingLayouts[i].Get();
+                BindingLayout* layout = checked_cast<BindingLayout*>(pso->desc.globalBindingLayouts[i].Get());
 
                 if ((layout->desc.visibility & ShaderType::AllRayTracing) == 0)
                     continue;
@@ -850,7 +872,7 @@ namespace nvrhi::vulkan
 
         if (arraysAreDifferent(m_CurrentRayTracingState.bindings, state.bindings) || m_AnyVolatileBufferWrites)
         {
-            bindBindingSets(vk::PipelineBindPoint::eRayTracingKHR, pso->pipelineLayout, state.bindings);
+            bindBindingSets(vk::PipelineBindPoint::eRayTracingKHR, pso->pipelineLayout, state.bindings, pso->descriptorSetIdxToBindingIdx);
         }
 
         // Rebuild the SBT if we're binding a new one or if it's been changed since the previous bind.
@@ -984,7 +1006,7 @@ namespace nvrhi::vulkan
         {
             RayTracingPipeline* pso = checked_cast<RayTracingPipeline*>(m_CurrentRayTracingState.shaderTable->getPipeline());
 
-            bindBindingSets(vk::PipelineBindPoint::eRayTracingKHR, pso->pipelineLayout, m_CurrentComputeState.bindings);
+            bindBindingSets(vk::PipelineBindPoint::eRayTracingKHR, pso->pipelineLayout, m_CurrentComputeState.bindings, pso->descriptorSetIdxToBindingIdx);
 
             m_AnyVolatileBufferWrites = false;
         }
@@ -1014,52 +1036,13 @@ namespace nvrhi::vulkan
         RayTracingPipeline* pso = new RayTracingPipeline(m_Context);
         pso->desc = desc;
 
-        // TODO: move the pipeline layout creation to a common function
-
-        for (const BindingLayoutHandle& _layout : desc.globalBindingLayouts)
-        {
-            BindingLayout* layout = checked_cast<BindingLayout*>(_layout.Get());
-            pso->pipelineBindingLayouts.push_back(layout);
-        }
-
-        BindingVector<vk::DescriptorSetLayout> descriptorSetLayouts;
-        uint32_t pushConstantSize = 0;
-        pso->pushConstantVisibility = vk::ShaderStageFlagBits();
-        for (const BindingLayoutHandle& _layout : desc.globalBindingLayouts)
-        {
-            BindingLayout* layout = checked_cast<BindingLayout*>(_layout.Get());
-            descriptorSetLayouts.push_back(layout->descriptorSetLayout);
-
-            if (!layout->isBindless)
-            {
-                for (const BindingLayoutItem& item : layout->desc.bindings)
-                {
-                    if (item.type == ResourceType::PushConstants)
-                    {
-                        pushConstantSize = item.size;
-                        pso->pushConstantVisibility = convertShaderTypeToShaderStageFlagBits(layout->desc.visibility);
-                        // assume there's only one push constant item in all layouts -- the validation layer makes sure of that
-                        break;
-                    }
-                }
-            }
-        }
-
-        auto pushConstantRange = vk::PushConstantRange()
-            .setOffset(0)
-            .setSize(pushConstantSize)
-            .setStageFlags(pso->pushConstantVisibility);
-
-        auto pipelineLayoutInfo = vk::PipelineLayoutCreateInfo()
-            .setSetLayoutCount(uint32_t(descriptorSetLayouts.size()))
-            .setPSetLayouts(descriptorSetLayouts.data())
-            .setPushConstantRangeCount(pushConstantSize ? 1 : 0)
-            .setPPushConstantRanges(&pushConstantRange);
-
-        vk::Result res = m_Context.device.createPipelineLayout(&pipelineLayoutInfo,
-                                                               m_Context.allocationCallbacks,
-                                                               &pso->pipelineLayout);
-
+        vk::Result res = createPipelineLayout(
+            pso->pipelineLayout,
+            pso->pipelineBindingLayouts,
+            pso->pushConstantVisibility,
+            pso->descriptorSetIdxToBindingIdx,
+            m_Context,
+            desc.globalBindingLayouts);
         CHECK_VK_FAIL(res)
 
         // Count all shader modules with their specializations,

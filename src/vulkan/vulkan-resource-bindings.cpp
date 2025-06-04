@@ -22,6 +22,7 @@
 
 #include "vulkan-backend.h"
 #include <nvrhi/common/misc.h>
+#include <sstream>
 
 namespace nvrhi::vulkan
 {
@@ -44,6 +45,38 @@ namespace nvrhi::vulkan
         return BindingLayoutHandle::Create(ret);
     }
 
+    static uint32_t getRegisterOffsetForResourceType(VulkanBindingOffsets const& bindingOffsets, ResourceType type)
+    {
+        switch (type)
+        {
+        case ResourceType::Texture_SRV:
+        case ResourceType::TypedBuffer_SRV:
+        case ResourceType::StructuredBuffer_SRV:
+        case ResourceType::RawBuffer_SRV:
+        case ResourceType::RayTracingAccelStruct:
+            return bindingOffsets.shaderResource;
+
+        case ResourceType::Texture_UAV:
+        case ResourceType::TypedBuffer_UAV:
+        case ResourceType::StructuredBuffer_UAV:
+        case ResourceType::RawBuffer_UAV:
+            return bindingOffsets.unorderedAccess;
+
+        case ResourceType::ConstantBuffer:
+        case ResourceType::VolatileConstantBuffer:
+        case ResourceType::PushConstants:
+            return bindingOffsets.constantBuffer;
+            break;
+
+        case ResourceType::Sampler:
+            return bindingOffsets.sampler;
+
+        default:
+            utils::InvalidEnum();
+            return 0;
+        }        
+    }
+
     BindingLayout::BindingLayout(const VulkanContext& context, const BindingLayoutDesc& _desc)
         : desc(_desc)
         , isBindless(false)
@@ -54,81 +87,17 @@ namespace nvrhi::vulkan
         // iterate over all binding types and add to map
         for (const BindingLayoutItem& binding : desc.bindings)
         {
-            vk::DescriptorType descriptorType;
-            uint32_t descriptorCount = 1;
-            uint32_t registerOffset;
-
-            switch (binding.type)
+            if (binding.type == ResourceType::PushConstants)
             {
-            case ResourceType::Texture_SRV:
-                registerOffset = _desc.bindingOffsets.shaderResource;
-                descriptorType = vk::DescriptorType::eSampledImage;
-                break;
-
-            case ResourceType::Texture_UAV:
-                registerOffset = _desc.bindingOffsets.unorderedAccess;
-                descriptorType = vk::DescriptorType::eStorageImage;
-                break;
-
-            case ResourceType::TypedBuffer_SRV:
-                registerOffset = _desc.bindingOffsets.shaderResource;
-                descriptorType = vk::DescriptorType::eUniformTexelBuffer;
-                break;
-
-            case ResourceType::StructuredBuffer_SRV:
-            case ResourceType::RawBuffer_SRV:
-                registerOffset = _desc.bindingOffsets.shaderResource;
-                descriptorType = vk::DescriptorType::eStorageBuffer;
-                break;
-
-            case ResourceType::TypedBuffer_UAV:
-                registerOffset = _desc.bindingOffsets.unorderedAccess;
-                descriptorType = vk::DescriptorType::eStorageTexelBuffer;
-                break;
-
-            case ResourceType::StructuredBuffer_UAV:
-            case ResourceType::RawBuffer_UAV:
-                registerOffset = _desc.bindingOffsets.unorderedAccess;
-                descriptorType = vk::DescriptorType::eStorageBuffer;
-                break;
-
-            case ResourceType::ConstantBuffer:
-                registerOffset = _desc.bindingOffsets.constantBuffer;
-                descriptorType = vk::DescriptorType::eUniformBuffer;
-                break;
-
-            case ResourceType::VolatileConstantBuffer:
-                registerOffset = _desc.bindingOffsets.constantBuffer;
-                descriptorType = vk::DescriptorType::eUniformBufferDynamic;
-                break;
-
-            case ResourceType::Sampler:
-                registerOffset = _desc.bindingOffsets.sampler;
-                descriptorType = vk::DescriptorType::eSampler;
-                break;
-
-            case ResourceType::PushConstants:
-                // don't need any descriptors for the push constants, but the vulkanLayoutBindings array 
-                // must match the binding layout items for further processing within nvrhi --
-                // so set descriptorCount to 0 instead of skipping it
-                registerOffset = _desc.bindingOffsets.constantBuffer;
-                descriptorType = vk::DescriptorType::eUniformBuffer;
-                descriptorCount = 0;
-                break;
-
-            case ResourceType::RayTracingAccelStruct:
-                registerOffset = _desc.bindingOffsets.shaderResource;
-                descriptorType = vk::DescriptorType::eAccelerationStructureKHR;
-                break;
-
-            case ResourceType::None:
-            case ResourceType::Count:
-            default:
-                utils::InvalidEnum();
+                // Don't need any descriptors for the push constants
                 continue;
             }
 
-            const auto bindingLocation = registerOffset + binding.slot;
+            vk::DescriptorType const descriptorType = convertResourceType(binding.type);
+            uint32_t const descriptorCount = binding.size;
+            uint32_t const registerOffset = getRegisterOffsetForResourceType(_desc.bindingOffsets, binding.type);
+
+            const uint32_t bindingLocation = registerOffset + binding.slot;
 
             vk::DescriptorSetLayoutBinding descriptorSetLayoutBinding = vk::DescriptorSetLayoutBinding()
                 .setBinding(bindingLocation)
@@ -153,59 +122,10 @@ namespace nvrhi::vulkan
         // iterate over all binding types and add to map
         for (const BindingLayoutItem& space : bindlessDesc.registerSpaces)
         {
-            vk::DescriptorType descriptorType;
-
-            switch (space.type)
-            {
-            case ResourceType::Texture_SRV:
-                descriptorType = vk::DescriptorType::eSampledImage;
-                break;
-
-            case ResourceType::Texture_UAV:
-                descriptorType = vk::DescriptorType::eStorageImage;
-                break;
-
-            case ResourceType::TypedBuffer_SRV:
-                descriptorType = vk::DescriptorType::eUniformTexelBuffer;
-                break;
-
-            case ResourceType::TypedBuffer_UAV:
-                descriptorType = vk::DescriptorType::eStorageTexelBuffer;
-                break;
-
-            case ResourceType::StructuredBuffer_SRV:
-            case ResourceType::StructuredBuffer_UAV:
-            case ResourceType::RawBuffer_SRV:
-            case ResourceType::RawBuffer_UAV:
-                descriptorType = vk::DescriptorType::eStorageBuffer;
-                break;
-
-            case ResourceType::ConstantBuffer:
-                descriptorType = vk::DescriptorType::eUniformBuffer;
-                break;
-
-            case ResourceType::VolatileConstantBuffer:
+            vk::DescriptorType const descriptorType = convertResourceType(space.type);
+            
+            if (space.type == ResourceType::VolatileConstantBuffer)
                 m_Context.error("Volatile constant buffers are not supported in bindless layouts");
-                descriptorType = vk::DescriptorType::eUniformBufferDynamic;
-                break;
-
-            case ResourceType::Sampler:
-                descriptorType = vk::DescriptorType::eSampler;
-                break;
-
-            case ResourceType::PushConstants:
-                continue;
-
-            case ResourceType::RayTracingAccelStruct:
-                descriptorType = vk::DescriptorType::eAccelerationStructureKHR;
-                break;
-
-            case ResourceType::None:
-            case ResourceType::Count:
-            default:
-                utils::InvalidEnum();
-                continue;
-            }
 
             vk::DescriptorSetLayoutBinding descriptorSetLayoutBinding = vk::DescriptorSetLayoutBinding()
                 .setBinding(bindingPoint)
@@ -336,14 +256,19 @@ namespace nvrhi::vulkan
         CHECK_VK_FAIL(res)
         
         // collect all of the descriptor write data
-        static_vector<vk::DescriptorImageInfo, c_MaxBindingsPerLayout> descriptorImageInfo;
-        static_vector<vk::DescriptorBufferInfo, c_MaxBindingsPerLayout> descriptorBufferInfo;
-        static_vector<vk::WriteDescriptorSet, c_MaxBindingsPerLayout> descriptorWriteInfo;
-        static_vector<vk::WriteDescriptorSetAccelerationStructureKHR, c_MaxBindingsPerLayout> accelStructWriteInfo;
+        std::vector<vk::DescriptorImageInfo> descriptorImageInfo;
+        std::vector<vk::DescriptorBufferInfo> descriptorBufferInfo;
+        std::vector<vk::WriteDescriptorSet> descriptorWriteInfo;
+        std::vector<vk::WriteDescriptorSetAccelerationStructureKHR> accelStructWriteInfo;
+        descriptorImageInfo.reserve(desc.bindings.size());
+        descriptorBufferInfo.reserve(desc.bindings.size());
+        descriptorWriteInfo.reserve(desc.bindings.size());
+        accelStructWriteInfo.reserve(desc.bindings.size());
 
         auto generateWriteDescriptorData =
             // generates a vk::WriteDescriptorSet struct in descriptorWriteInfo
             [&](uint32_t bindingLocation,
+                uint32_t arrayElement,
                 vk::DescriptorType descriptorType,
                 vk::DescriptorImageInfo *imageInfo,
                 vk::DescriptorBufferInfo *bufferInfo,
@@ -354,7 +279,7 @@ namespace nvrhi::vulkan
                 vk::WriteDescriptorSet()
                 .setDstSet(ret->descriptorSet)
                 .setDstBinding(bindingLocation)
-                .setDstArrayElement(0)
+                .setDstArrayElement(arrayElement)
                 .setDescriptorCount(1)
                 .setDescriptorType(descriptorType)
                 .setPImageInfo(imageInfo)
@@ -367,7 +292,6 @@ namespace nvrhi::vulkan
         for (size_t bindingIndex = 0; bindingIndex < desc.bindings.size(); bindingIndex++)
         {
             const BindingSetItem& binding = desc.bindings[bindingIndex];
-            const vk::DescriptorSetLayoutBinding& layoutBinding = layout->vulkanLayoutBindings[bindingIndex];
 
             if (binding.resourceHandle == nullptr)
             {
@@ -376,6 +300,9 @@ namespace nvrhi::vulkan
 
             ret->resources.push_back(binding.resourceHandle); // keep a strong reference to the resource
 
+            vk::DescriptorType const descriptorType = convertResourceType(binding.type);
+            uint32_t const registerOffset = getRegisterOffsetForResourceType(layout->desc.bindingOffsets, binding.type);
+            
             switch (binding.type)
             {
             case ResourceType::Texture_SRV:
@@ -384,15 +311,17 @@ namespace nvrhi::vulkan
 
                 const auto subresource = binding.subresources.resolve(texture->desc, false);
                 const auto textureViewType = getTextureViewType(binding.format, texture->desc.format);
-                auto& view = texture->getSubresourceView(subresource, binding.dimension, binding.format, textureViewType);
+                auto& view = texture->getSubresourceView(subresource, binding.dimension, binding.format, vk::ImageUsageFlagBits::eSampled, textureViewType);
 
                 auto& imageInfo = descriptorImageInfo.emplace_back();
                 imageInfo = vk::DescriptorImageInfo()
                     .setImageView(view.view)
                     .setImageLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
 
-                generateWriteDescriptorData(layoutBinding.binding,
-                    layoutBinding.descriptorType,
+                generateWriteDescriptorData(
+                    registerOffset + binding.slot,
+                    binding.arrayElement,
+                    descriptorType,
                     &imageInfo, nullptr, nullptr);
 
                 if (!texture->permanentState)
@@ -411,15 +340,17 @@ namespace nvrhi::vulkan
 
                 const auto subresource = binding.subresources.resolve(texture->desc, true);
                 const auto textureViewType = getTextureViewType(binding.format, texture->desc.format);
-                auto& view = texture->getSubresourceView(subresource, binding.dimension, binding.format, textureViewType);
+                auto& view = texture->getSubresourceView(subresource, binding.dimension, binding.format, vk::ImageUsageFlagBits::eStorage, textureViewType);
 
                 auto& imageInfo = descriptorImageInfo.emplace_back();
                 imageInfo = vk::DescriptorImageInfo()
                     .setImageView(view.view)
                     .setImageLayout(vk::ImageLayout::eGeneral);
 
-                generateWriteDescriptorData(layoutBinding.binding,
-                    layoutBinding.descriptorType,
+                generateWriteDescriptorData(
+                    registerOffset + binding.slot,
+                    binding.arrayElement,
+                    descriptorType,
                     &imageInfo, nullptr, nullptr);
 
                 if (!texture->permanentState)
@@ -473,8 +404,10 @@ namespace nvrhi::vulkan
                     ASSERT_VK_OK(res);
                 }
 
-                generateWriteDescriptorData(layoutBinding.binding,
-                    layoutBinding.descriptorType,
+                generateWriteDescriptorData(
+                    registerOffset + binding.slot,
+                    binding.arrayElement,
+                    descriptorType,
                     nullptr, nullptr, &bufferViewRef);
 
                 if (!buffer->permanentState)
@@ -511,8 +444,10 @@ namespace nvrhi::vulkan
                     .setRange(range.byteSize);
 
                 assert(buffer->buffer);
-                generateWriteDescriptorData(layoutBinding.binding,
-                    layoutBinding.descriptorType,
+                generateWriteDescriptorData(
+                    registerOffset + binding.slot,
+                    binding.arrayElement,
+                    descriptorType,
                     nullptr, &bufferInfo, nullptr);
 
                 if (binding.type == ResourceType::VolatileConstantBuffer) 
@@ -550,8 +485,10 @@ namespace nvrhi::vulkan
                 imageInfo = vk::DescriptorImageInfo()
                     .setSampler(sampler->sampler);
 
-                generateWriteDescriptorData(layoutBinding.binding,
-                    layoutBinding.descriptorType,
+                generateWriteDescriptorData(
+                    registerOffset + binding.slot,
+                    binding.arrayElement,
+                    descriptorType,
                     &imageInfo, nullptr, nullptr);
             }
 
@@ -565,8 +502,10 @@ namespace nvrhi::vulkan
                 accelStructWrite.accelerationStructureCount = 1;
                 accelStructWrite.pAccelerationStructures = &as->accelStruct;
 
-                generateWriteDescriptorData(layoutBinding.binding,
-                    layoutBinding.descriptorType,
+                generateWriteDescriptorData(
+                    registerOffset + binding.slot,
+                    binding.arrayElement,
+                    descriptorType,
                     nullptr, nullptr, nullptr, &accelStructWrite);
 
                 ret->bindingsThatNeedTransitions.push_back(static_cast<uint16_t>(bindingIndex));
@@ -690,9 +629,9 @@ namespace nvrhi::vulkan
         vk::Result res;
 
         // collect all of the descriptor write data
-        static_vector<vk::DescriptorImageInfo, c_MaxBindingsPerLayout> descriptorImageInfo;
-        static_vector<vk::DescriptorBufferInfo, c_MaxBindingsPerLayout> descriptorBufferInfo;
-        static_vector<vk::WriteDescriptorSet, c_MaxBindingsPerLayout> descriptorWriteInfo;
+        static_vector<vk::DescriptorImageInfo, c_MaxBindlessRegisterSpaces> descriptorImageInfo;
+        static_vector<vk::DescriptorBufferInfo, c_MaxBindlessRegisterSpaces> descriptorBufferInfo;
+        static_vector<vk::WriteDescriptorSet, c_MaxBindlessRegisterSpaces> descriptorWriteInfo;
 
         auto generateWriteDescriptorData =
             // generates a vk::WriteDescriptorSet struct in descriptorWriteInfo
@@ -729,7 +668,7 @@ namespace nvrhi::vulkan
 
                     const auto subresource = binding.subresources.resolve(texture->desc, false);
                     const auto textureViewType = getTextureViewType(binding.format, texture->desc.format);
-                    auto& view = texture->getSubresourceView(subresource, binding.dimension, binding.format, textureViewType);
+                    auto& view = texture->getSubresourceView(subresource, binding.dimension, binding.format, vk::ImageUsageFlagBits::eSampled, textureViewType);
 
                     auto& imageInfo = descriptorImageInfo.emplace_back();
                     imageInfo = vk::DescriptorImageInfo()
@@ -749,7 +688,7 @@ namespace nvrhi::vulkan
 
                     const auto subresource = binding.subresources.resolve(texture->desc, true);
                     const auto textureViewType = getTextureViewType(binding.format, texture->desc.format);
-                    auto& view = texture->getSubresourceView(subresource, binding.dimension, binding.format, textureViewType);
+                    auto& view = texture->getSubresourceView(subresource, binding.dimension, binding.format, vk::ImageUsageFlagBits::eStorage, textureViewType);
 
                     auto& imageInfo = descriptorImageInfo.emplace_back();
                     imageInfo = vk::DescriptorImageInfo()
@@ -859,57 +798,213 @@ namespace nvrhi::vulkan
         return true;
     }
 
-    void CommandList::bindBindingSets(vk::PipelineBindPoint bindPoint, vk::PipelineLayout pipelineLayout, const BindingSetVector& bindings)
+    void CommandList::bindBindingSets(vk::PipelineBindPoint bindPoint, vk::PipelineLayout pipelineLayout, const BindingSetVector& bindings, BindingVector<uint32_t> const& descriptorSetIdxToBindingIdx)
     {
+        const uint32_t numBindings = (uint32_t)bindings.size();
+        const uint32_t numDescriptorSets = descriptorSetIdxToBindingIdx.empty() ? numBindings : (uint32_t)descriptorSetIdxToBindingIdx.size();
+
         BindingVector<vk::DescriptorSet> descriptorSets;
+        uint32_t nextDescriptorSetToBind = 0;
         static_vector<uint32_t, c_MaxVolatileConstantBuffers> dynamicOffsets;
-
-        for (const auto& bindingSetHandle : bindings)
+        for (uint32_t i = 0; i < numDescriptorSets; ++i)
         {
-            const BindingSetDesc* desc = bindingSetHandle->getDesc();
-            if (desc)
+            IBindingSet* bindingSetHandle = nullptr;
+            if (descriptorSetIdxToBindingIdx.empty())
             {
-                BindingSet* bindingSet = checked_cast<BindingSet*>(bindingSetHandle);
-                descriptorSets.push_back(bindingSet->descriptorSet);
+                bindingSetHandle = bindings[i];
+            }
+            else if(descriptorSetIdxToBindingIdx[i] != 0xffffffff)
+            {
+                bindingSetHandle = bindings[descriptorSetIdxToBindingIdx[i]];
+            }
 
-                for (Buffer* constnatBuffer : bindingSet->volatileConstantBuffers)
+            if (bindingSetHandle == nullptr)
+            {
+                // This is a hole in the descriptor sets, so bind the contiguous descriptor sets we've got so far
+                if (!descriptorSets.empty())
                 {
-                    auto found = m_VolatileBufferStates.find(constnatBuffer);
-                    if (found == m_VolatileBufferStates.end())
-                    {
-                        std::stringstream ss;
-                        ss << "Binding volatile constant buffer " << utils::DebugNameToString(constnatBuffer->desc.debugName)
-                           << " before writing into it is invalid.";
-                        m_Context.error(ss.str());
+                    m_CurrentCmdBuf->cmdBuf.bindDescriptorSets(bindPoint, pipelineLayout,
+                        /* firstSet = */ nextDescriptorSetToBind, uint32_t(descriptorSets.size()), descriptorSets.data(),
+                        uint32_t(dynamicOffsets.size()), dynamicOffsets.data());
 
-                        dynamicOffsets.push_back(0); // use zero offset just to use something
-                    }
-                    else
-                    {
-                        uint32_t version = found->second.latestVersion;
-                        uint64_t offset = version * constnatBuffer->desc.byteSize;
-                        assert(offset < std::numeric_limits<uint32_t>::max());
-                        dynamicOffsets.push_back(uint32_t(offset));
-                    }
+                    descriptorSets.resize(0);
+                    dynamicOffsets.resize(0);
                 }
-
-                if (desc->trackLiveness)
-                    m_CurrentCmdBuf->referencedResources.push_back(bindingSetHandle);
+                nextDescriptorSetToBind = i + 1;
             }
             else
             {
-                DescriptorTable* table = checked_cast<DescriptorTable*>(bindingSetHandle);
-                descriptorSets.push_back(table->descriptorSet);
+                const BindingSetDesc* desc = bindingSetHandle->getDesc();
+                if (desc)
+                {
+                    BindingSet* bindingSet = checked_cast<BindingSet*>(bindingSetHandle);
+                    descriptorSets.push_back(bindingSet->descriptorSet);
+
+                    for (Buffer* constantBuffer : bindingSet->volatileConstantBuffers)
+                    {
+                        auto found = m_VolatileBufferStates.find(constantBuffer);
+                        if (found == m_VolatileBufferStates.end())
+                        {
+                            std::stringstream ss;
+                            ss << "Binding volatile constant buffer " << utils::DebugNameToString(constantBuffer->desc.debugName)
+                                << " before writing into it is invalid.";
+                            m_Context.error(ss.str());
+
+                            dynamicOffsets.push_back(0); // use zero offset just to use something
+                        }
+                        else
+                        {
+                            uint32_t version = found->second.latestVersion;
+                            uint64_t offset = version * constantBuffer->desc.byteSize;
+                            assert(offset < std::numeric_limits<uint32_t>::max());
+                            dynamicOffsets.push_back(uint32_t(offset));
+                        }
+                    }
+
+                    if (desc->trackLiveness)
+                        m_CurrentCmdBuf->referencedResources.push_back(bindingSetHandle);
+                }
+                else
+                {
+                    DescriptorTable* table = checked_cast<DescriptorTable*>(bindingSetHandle);
+                    descriptorSets.push_back(table->descriptorSet);
+                }
             }
         }
-
         if (!descriptorSets.empty())
         {
+            // Bind the remaining sets
             m_CurrentCmdBuf->cmdBuf.bindDescriptorSets(bindPoint, pipelineLayout,
-                /* firstSet = */ 0, uint32_t(descriptorSets.size()), descriptorSets.data(),
+                /* firstSet = */ nextDescriptorSetToBind, uint32_t(descriptorSets.size()), descriptorSets.data(),
                 uint32_t(dynamicOffsets.size()), dynamicOffsets.data());
         }
     }
 
+    vk::Result createPipelineLayout(
+        vk::PipelineLayout& outPipelineLayout,
+        BindingVector<RefCountPtr<BindingLayout>>& outBindingLayouts,
+        vk::ShaderStageFlags& outPushConstantVisibility,
+        BindingVector<uint32_t>& outDescriptorSetIdxToBindingIdx,
+        VulkanContext const& context,
+        BindingLayoutVector const& inBindingLayouts)
+    {
+        // Establish if we're going to use outDescriptorSetIdxToBindingIdx
+        // We do this if the layout descs specify registerSpaceIsDescriptorSet
+        // (Validation ensures all the binding layouts have it set to the same value)
+        bool createDescriptorSetIdxToBindingIdx = false;
+        for (BindingLayoutHandle const& _layout : inBindingLayouts)
+        {
+            BindingLayout const* layout = checked_cast<BindingLayout const*>(_layout.Get());
+            if (!layout->isBindless)
+            {
+                createDescriptorSetIdxToBindingIdx = layout->getDesc()->registerSpaceIsDescriptorSet;
+                break;
+            }
+        }
+
+        if (createDescriptorSetIdxToBindingIdx)
+        {
+            // Figure out how many descriptor sets we'll need in outBindingLayouts.
+            // There's not necessarily a one-to-one relationship because there could potentially be
+            // holes in binding layout.  E.g. if a binding layout uses register spaces 0 and 2
+            // then we'll need to use 3 descriptor sets, with a hole at index 1 because Vulkan
+            // descriptor set indices map to register spaces.
+            // Bindless layouts are assumed to not need binding to specific descriptor set
+            // indices, so we put those last
+            uint32_t numRegularDescriptorSets = 0;
+            for (BindingLayoutHandle const& _layout : inBindingLayouts)
+            {
+                BindingLayout const* layout = checked_cast<BindingLayout const*>(_layout.Get());
+                if (!layout->isBindless)
+                {
+                    numRegularDescriptorSets = std::max(numRegularDescriptorSets, layout->getDesc()->registerSpace + 1);
+                }
+            }
+
+            // Now create the layout
+            outBindingLayouts.resize(numRegularDescriptorSets);
+            outDescriptorSetIdxToBindingIdx.resize(numRegularDescriptorSets);
+            for (uint32_t i = 0; i < numRegularDescriptorSets; ++i)
+            {
+                outDescriptorSetIdxToBindingIdx[i] = 0xffffffff;
+            }
+            for (uint32_t i = 0; i < (uint32_t)inBindingLayouts.size(); ++i)
+            {
+                BindingLayout* layout = checked_cast<BindingLayout*>(inBindingLayouts[i].Get());
+                if (layout->isBindless)
+                {
+                    outBindingLayouts.push_back(layout);
+                    // Let's always put the bindless ones at the end.
+                    outDescriptorSetIdxToBindingIdx.push_back(i);
+                }
+                else
+                {
+                    uint32_t const descriptorSetIdx = layout->getDesc()->registerSpace;
+                    // Can't have multiple binding sets with the same registerSpace
+                    // Should not have passed validation in validatePipelineBindingLayouts
+                    assert(outBindingLayouts[descriptorSetIdx] == nullptr);
+                    outBindingLayouts[descriptorSetIdx] = layout;
+                    outDescriptorSetIdxToBindingIdx[descriptorSetIdx] = i;
+                }
+            }
+        }
+        else
+        {
+            // Legacy behaviour mode, where we don't fill in outDescriptorSetIdxToBindingIdx
+            // In this mode, there can be no holes in the binding layout
+            for (const BindingLayoutHandle& _layout : inBindingLayouts)
+            {
+                BindingLayout* layout = checked_cast<BindingLayout*>(_layout.Get());
+                outBindingLayouts.push_back(layout);
+            }
+        }
+
+        BindingVector<vk::DescriptorSetLayout> descriptorSetLayouts;
+        uint32_t pushConstantSize = 0;
+        outPushConstantVisibility = vk::ShaderStageFlagBits();
+        for (BindingLayout const* layout : outBindingLayouts)
+        {
+            if (layout)
+            {
+                descriptorSetLayouts.push_back(layout->descriptorSetLayout);
+
+                if (!layout->isBindless)
+                {
+                    for (const BindingLayoutItem& item : layout->desc.bindings)
+                    {
+                        if (item.type == ResourceType::PushConstants)
+                        {
+                            pushConstantSize = item.size;
+                            outPushConstantVisibility = convertShaderTypeToShaderStageFlagBits(layout->desc.visibility);
+                            // assume there's only one push constant item in all layouts -- the validation layer makes sure of that
+                            break;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // Empty descriptor set
+                descriptorSetLayouts.push_back(context.emptyDescriptorSetLayout);
+            }
+        }
+
+        auto pushConstantRange = vk::PushConstantRange()
+            .setOffset(0)
+            .setSize(pushConstantSize)
+            .setStageFlags(outPushConstantVisibility);
+
+        auto pipelineLayoutInfo = vk::PipelineLayoutCreateInfo()
+            .setSetLayoutCount(uint32_t(descriptorSetLayouts.size()))
+            .setPSetLayouts(descriptorSetLayouts.data())
+            .setPushConstantRangeCount(pushConstantSize ? 1 : 0)
+            .setPPushConstantRanges(&pushConstantRange);
+
+        vk::Result res = context.device.createPipelineLayout(&pipelineLayoutInfo,
+            context.allocationCallbacks,
+            &outPipelineLayout);
+
+        return res;
+    }
 
 } // namespace nvrhi::vulkan

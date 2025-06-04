@@ -24,6 +24,7 @@
 
 #include <nvrhi/vulkan.h>
 #include <nvrhi/utils.h>
+#include <nvrhi/common/aftermath.h>
 #include "../common/state-tracking.h"
 #include "../common/versioning.h"
 #include <mutex>
@@ -116,6 +117,7 @@ namespace nvrhi::vulkan
     vk::GeometryInstanceFlagsKHR convertInstanceFlags(rt::InstanceFlags instanceFlags);
     vk::Extent2D convertFragmentShadingRate(VariableShadingRate shadingRate);
     vk::FragmentShadingRateCombinerOpKHR convertShadingRateCombiner(ShadingRateCombiner combiner);
+    vk::DescriptorType convertResourceType(ResourceType type);
 
     void countSpecializationConstants(
         Shader* shader,
@@ -171,6 +173,11 @@ namespace nvrhi::vulkan
             bool EXT_conservative_rasterization = false;
             bool EXT_opacity_micromap = false;
             bool NV_ray_tracing_invocation_reorder = false;
+            bool EXT_debug_utils = false;
+#if NVRHI_WITH_AFTERMATH
+            bool NV_device_diagnostic_checkpoints = false;
+            bool NV_device_diagnostics_config= false;
+#endif
         } extensions;
 
         vk::PhysicalDeviceProperties physicalDeviceProperties;
@@ -181,13 +188,16 @@ namespace nvrhi::vulkan
         vk::PhysicalDeviceOpacityMicromapPropertiesEXT opacityMicromapProperties;
         vk::PhysicalDeviceRayTracingInvocationReorderPropertiesNV nvRayTracingInvocationReorderProperties;
         vk::PhysicalDeviceFragmentShadingRateFeaturesKHR shadingRateFeatures;
+        vk::PhysicalDeviceSubgroupProperties subgroupProperties;
         IMessageCallback* messageCallback = nullptr;
 #ifdef NVRHI_WITH_RTXMU
         std::unique_ptr<rtxmu::VkAccelStructManager> rtxMemUtil;
         std::unique_ptr<RtxMuResources> rtxMuResources;
 #endif
+        vk::DescriptorSetLayout emptyDescriptorSetLayout;
 
-        void nameVKObject(const void* handle, vk::DebugReportObjectTypeEXT objtype, const char* name) const;
+        void nameVKObject(const void* handle, const vk::ObjectType objtype,
+            const vk::DebugReportObjectTypeEXT objtypeEXT, const char* name) const;
         void error(const std::string& message) const;
         void warning(const std::string& message) const;
     };
@@ -243,6 +253,8 @@ namespace nvrhi::vulkan
 
         // submits a command buffer to this queue, returns submissionID
         uint64_t submit(ICommandList* const* ppCmd, size_t numCmd);
+
+        void updateTextureTileMappings(ITexture* texture, const TextureTilesMapping* tileMappings, uint32_t numTileMappings);
 
         // retire any command buffers that have finished execution from the pending execution list
         void retireCommandBuffers();
@@ -316,9 +328,8 @@ namespace nvrhi::vulkan
     class Heap : public MemoryResource, public RefCounter<IHeap>
     {
     public:
-        explicit Heap(const VulkanContext& context, VulkanAllocator& allocator)
-            : m_Context(context)
-            , m_Allocator(allocator)
+        explicit Heap(VulkanAllocator& allocator)
+            : m_Allocator(allocator)
         { }
 
         ~Heap() override;
@@ -328,7 +339,6 @@ namespace nvrhi::vulkan
         const HeapDesc& getDesc() override { return desc; }
 
     private:
-        const VulkanContext& m_Context;
         VulkanAllocator& m_Allocator;
     };
 
@@ -366,11 +376,13 @@ namespace nvrhi::vulkan
             StencilOnly
         };
 
+        typedef std::tuple<TextureSubresourceSet, TextureSubresourceViewType, TextureDimension, Format, vk::ImageUsageFlags> SubresourceViewKey;
+
         struct Hash
         {
-            std::size_t operator()(std::tuple<TextureSubresourceSet, TextureSubresourceViewType, TextureDimension, Format> const& s) const noexcept
+            std::size_t operator()(SubresourceViewKey const& s) const noexcept
             {
-                const auto& [subresources, viewType, dimension, format] = s;
+                const auto& [subresources, viewType, dimension, format, usage] = s;
 
                 size_t hash = 0;
 
@@ -381,6 +393,7 @@ namespace nvrhi::vulkan
                 hash_combine(hash, viewType);
                 hash_combine(hash, dimension);
                 hash_combine(hash, format);
+                hash_combine(hash, uint32_t(usage));
 
                 return hash;
             }
@@ -392,14 +405,15 @@ namespace nvrhi::vulkan
         vk::ImageCreateInfo imageInfo;
         vk::ExternalMemoryImageCreateInfo externalMemoryImageInfo;
         vk::Image image;
+        static constexpr uint32_t tileByteSize = 65536;
 
         HeapHandle heap;
 
         void* sharedHandle = nullptr;
-        
+
         // contains subresource views for this texture
         // note that we only create the views that the app uses, and that multiple views may map to the same subresources
-        std::unordered_map<std::tuple<TextureSubresourceSet, TextureSubresourceViewType, TextureDimension, Format>, TextureSubresourceView, Texture::Hash> subresourceViews;
+        std::unordered_map<SubresourceViewKey, TextureSubresourceView, Texture::Hash> subresourceViews;
 
         Texture(const VulkanContext& context, VulkanAllocator& allocator)
             : TextureStateExtension(desc)
@@ -411,7 +425,7 @@ namespace nvrhi::vulkan
         // 'viewtype' only matters when asking for a depthstencil view; in situations where only depth or stencil can be bound
         // (such as an SRV with ImageLayout::eShaderReadOnlyOptimal), but not both, then this specifies which of the two aspect bits is to be set.
         TextureSubresourceView& getSubresourceView(const TextureSubresourceSet& subresources, TextureDimension dimension,
-            Format format, TextureSubresourceViewType viewtype = TextureSubresourceViewType::AllAspects);
+            Format format, vk::ImageUsageFlags usage, TextureSubresourceViewType viewtype = TextureSubresourceViewType::AllAspects);
         
         uint32_t getNumSubresources() const;
         uint32_t getSubresourceIndex(uint32_t mipLevel, uint32_t arrayLayer) const;
@@ -557,6 +571,7 @@ namespace nvrhi::vulkan
 
         ~Buffer() override;
         const BufferDesc& getDesc() const override { return desc; }
+        GpuVirtualAddress getGpuVirtualAddress() const override { return deviceAddress; }
         Object getNativeObject(ObjectType type) override;
 
     private:
@@ -630,8 +645,7 @@ namespace nvrhi::vulkan
         std::vector<ShaderSpecialization> specializationConstants;
 
         explicit Shader(const VulkanContext& context)
-            : desc(ShaderType::None)
-            , m_Context(context)
+            : m_Context(context)
         { }
 
         ~Shader() override;
@@ -798,6 +812,9 @@ namespace nvrhi::vulkan
         const BindingSetDesc* getDesc() const override { return nullptr; }
         IBindingLayout* getLayout() const override { return layout; }
         uint32_t getCapacity() const override { return capacity; }
+
+        // Vulkan doesnt not have a concept of the first descriptor in the heap
+        uint32_t getFirstDescriptorIndexInHeap() const override { return 0; }
         Object getNativeObject(ObjectType objectType) override;
 
     private:
@@ -807,6 +824,15 @@ namespace nvrhi::vulkan
     template <typename T>
     using BindingVector = static_vector<T, c_MaxBindingLayouts>;
 
+    // common code when creating shader pipelines to build binding set layouts
+    vk::Result createPipelineLayout(
+        vk::PipelineLayout& outPipelineLayout,
+        BindingVector<RefCountPtr<BindingLayout>>& outBindingLayouts,
+        vk::ShaderStageFlags& outPushConstantVisibility,
+        BindingVector<uint32_t>& outStateBindingIdxToPipelineBindingIdx,
+        VulkanContext const& context,
+        BindingLayoutVector const& inBindingLayouts);
+
     class GraphicsPipeline : public RefCounter<IGraphicsPipeline>
     {
     public:
@@ -814,6 +840,7 @@ namespace nvrhi::vulkan
         FramebufferInfo framebufferInfo;
         ShaderType shaderMask = ShaderType::None;
         BindingVector<RefCountPtr<BindingLayout>> pipelineBindingLayouts;
+        BindingVector<uint32_t> descriptorSetIdxToBindingIdx;
         vk::PipelineLayout pipelineLayout;
         vk::Pipeline pipeline;
         vk::ShaderStageFlags pushConstantVisibility;
@@ -838,6 +865,7 @@ namespace nvrhi::vulkan
         ComputePipelineDesc desc;
 
         BindingVector<RefCountPtr<BindingLayout>> pipelineBindingLayouts;
+        BindingVector<uint32_t> descriptorSetIdxToBindingIdx;
         vk::PipelineLayout pipelineLayout;
         vk::Pipeline pipeline;
         vk::ShaderStageFlags pushConstantVisibility;
@@ -861,6 +889,7 @@ namespace nvrhi::vulkan
         FramebufferInfo framebufferInfo;
         ShaderType shaderMask = ShaderType::None;
         BindingVector<RefCountPtr<BindingLayout>> pipelineBindingLayouts;
+        BindingVector<uint32_t> descriptorSetIdxToBindingIdx;
         vk::PipelineLayout pipelineLayout;
         vk::Pipeline pipeline;
         vk::ShaderStageFlags pushConstantVisibility;
@@ -884,6 +913,7 @@ namespace nvrhi::vulkan
     public:
         rt::PipelineDesc desc;
         BindingVector<RefCountPtr<BindingLayout>> pipelineBindingLayouts;
+        BindingVector<uint32_t> descriptorSetIdxToBindingIdx;
         vk::PipelineLayout pipelineLayout;
         vk::Pipeline pipeline;
         vk::ShaderStageFlags pushConstantVisibility;
@@ -1014,8 +1044,7 @@ namespace nvrhi::vulkan
         bool allowUpdate = false;
         bool compacted = false;
 
-        explicit OpacityMicromap(const VulkanContext& context)
-            : m_Context(context)
+        explicit OpacityMicromap()
         { }
 
         ~OpacityMicromap() override;
@@ -1024,9 +1053,6 @@ namespace nvrhi::vulkan
         const rt::OpacityMicromapDesc& getDesc() const override { return desc; }
         bool isCompacted() const override { return compacted; }
         uint64_t getDeviceAddress() const override;
-
-    private:
-        const VulkanContext& m_Context;
     };
 
     class Device : public RefCounter<nvrhi::vulkan::IDevice>
@@ -1058,6 +1084,12 @@ namespace nvrhi::vulkan
         StagingTextureHandle createStagingTexture(const TextureDesc& d, CpuAccessMode cpuAccess) override;
         void *mapStagingTexture(IStagingTexture* tex, const TextureSlice& slice, CpuAccessMode cpuAccess, size_t *outRowPitch) override;
         void unmapStagingTexture(IStagingTexture* tex) override;
+
+        void getTextureTiling(ITexture* texture, uint32_t* numTiles, PackedMipDesc* desc, TileShape* tileShape, uint32_t* subresourceTilingsNum, SubresourceTiling* subresourceTilings) override;
+        void updateTextureTileMappings(ITexture* texture, const TextureTilesMapping* tileMappings, uint32_t numTileMappings, CommandQueue executionQueue = CommandQueue::Graphics) override;
+
+        SamplerFeedbackTextureHandle createSamplerFeedbackTexture(ITexture* pairedTexture, const SamplerFeedbackTextureDesc& desc) override;
+        SamplerFeedbackTextureHandle createSamplerFeedbackForNativeTexture(ObjectType objectType, Object texture, ITexture* pairedTexture) override;
 
         BufferHandle createBuffer(const BufferDesc& d) override;
         void *mapBuffer(IBuffer* b, CpuAccessMode mapFlags) override;
@@ -1112,17 +1144,20 @@ namespace nvrhi::vulkan
         rt::OpacityMicromapHandle createOpacityMicromap(const rt::OpacityMicromapDesc& desc) override;
         rt::AccelStructHandle createAccelStruct(const rt::AccelStructDesc& desc) override;
         MemoryRequirements getAccelStructMemoryRequirements(rt::IAccelStruct* as) override;
+        rt::cluster::OperationSizeInfo getClusterOperationSizeInfo(const rt::cluster::OperationParams& params) override;
         bool bindAccelStructMemory(rt::IAccelStruct* as, IHeap* heap, uint64_t offset) override;
 
         CommandListHandle createCommandList(const CommandListParameters& params = CommandListParameters()) override;
         uint64_t executeCommandLists(ICommandList* const* pCommandLists, size_t numCommandLists, CommandQueue executionQueue = CommandQueue::Graphics) override;
         void queueWaitForCommandList(CommandQueue waitQueue, CommandQueue executionQueue, uint64_t instance) override;
-        void waitForIdle() override;
+        bool waitForIdle() override;
         void runGarbageCollection() override;
         bool queryFeatureSupport(Feature feature, void* pInfo = nullptr, size_t infoSize = 0) override;
         FormatSupport queryFormatSupport(Format format) override;
         Object getNativeQueue(ObjectType objectType, CommandQueue queue) override;
         IMessageCallback* getMessageCallback() override { return m_Context.messageCallback; }
+        bool isAftermathEnabled() override { return m_AftermathEnabled; }
+        AftermathCrashDumpHelper& getAftermathCrashDumpHelper() override { return m_AftermathCrashDumpHelper; }
 
         // vulkan::IDevice implementation
         VkSemaphore getQueueSemaphore(CommandQueue queue) override;
@@ -1145,6 +1180,8 @@ namespace nvrhi::vulkan
         std::array<std::unique_ptr<Queue>, uint32_t(CommandQueue::Count)> m_Queues;
         
         void *mapBuffer(IBuffer* b, CpuAccessMode flags, uint64_t offset, size_t size) const;
+        bool m_AftermathEnabled = false;
+        AftermathCrashDumpHelper m_AftermathCrashDumpHelper;
     };
 
     class CommandList : public RefCounter<ICommandList>
@@ -1153,6 +1190,7 @@ namespace nvrhi::vulkan
         // Internal backend methods
 
         CommandList(Device* device, const VulkanContext& context, const CommandListParameters& parameters);
+        ~CommandList() override;
 
         void executed(Queue& queue, uint64_t submissionID);
 
@@ -1169,6 +1207,9 @@ namespace nvrhi::vulkan
         void clearTextureFloat(ITexture* texture, TextureSubresourceSet subresources, const Color& clearColor) override;
         void clearDepthStencilTexture(ITexture* texture, TextureSubresourceSet subresources, bool clearDepth, float depth, bool clearStencil, uint8_t stencil) override;
         void clearTextureUInt(ITexture* texture, TextureSubresourceSet subresources, uint32_t clearColor) override;
+        void clearSamplerFeedbackTexture(ISamplerFeedbackTexture* texture) override;
+        void decodeSamplerFeedbackTexture(IBuffer* buffer, ISamplerFeedbackTexture* texture, Format format) override;
+        void setSamplerFeedbackTextureState(ISamplerFeedbackTexture* texture, ResourceStates stateBits) override;
 
         void copyTexture(ITexture* dest, const TextureSlice& destSlice, ITexture* src, const TextureSlice& srcSlice) override;
         void copyTexture(IStagingTexture* dest, const TextureSlice& dstSlice, ITexture* src, const TextureSlice& srcSlice) override;
@@ -1204,6 +1245,7 @@ namespace nvrhi::vulkan
         void buildTopLevelAccelStruct(rt::IAccelStruct* as, const rt::InstanceDesc* pInstances, size_t numInstances, rt::AccelStructBuildFlags buildFlags) override;
         void buildTopLevelAccelStructFromBuffer(rt::IAccelStruct* as, nvrhi::IBuffer* instanceBuffer, uint64_t instanceBufferOffset, size_t numInstances,
             rt::AccelStructBuildFlags buildFlags = rt::AccelStructBuildFlags::None) override;
+        void executeMultiIndirectClusterOperation(const rt::cluster::OperationDesc& desc) override;
 
         void beginTimerQuery(ITimerQuery* query) override;
         void endTimerQuery(ITimerQuery* query) override;
@@ -1249,6 +1291,10 @@ namespace nvrhi::vulkan
         // current internal command buffer
         TrackedCommandBufferPtr m_CurrentCmdBuf = nullptr;
 
+#if NVRHI_WITH_AFTERMATH
+        AftermathMarkerTracker m_AftermathTracker;
+#endif
+
         vk::PipelineLayout m_CurrentPipelineLayout;
         vk::ShaderStageFlags m_CurrentPushConstantsVisibility;
         GraphicsState m_CurrentGraphicsState{};
@@ -1273,7 +1319,7 @@ namespace nvrhi::vulkan
         
         void clearTexture(ITexture* texture, TextureSubresourceSet subresources, const vk::ClearColorValue& clearValue);
 
-        void bindBindingSets(vk::PipelineBindPoint bindPoint, vk::PipelineLayout pipelineLayout, const BindingSetVector& bindings);
+        void bindBindingSets(vk::PipelineBindPoint bindPoint, vk::PipelineLayout pipelineLayout, const BindingSetVector& bindings, BindingVector<uint32_t> const& descriptorSetIdxToBindingIdx);
 
         void endRenderPass();
 
