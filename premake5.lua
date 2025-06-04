@@ -7,7 +7,7 @@ targetdir("%{wks.location}/Binaries/" .. outputdir .. "/%{prj.name}")
 objdir("%{wks.location}/Binaries/Intermediates/" .. outputdir .. "/%{prj.name}")
 
 files {"include/**.h", "src/**.cpp", "src/**.h", "thirdparty/**.h", "thirdparty/**.hpp"}
-includedirs {"include", "src", "thirdparty/Vulkan-Headers/include"}
+includedirs {"include", "src", "thirdparty/Vulkan-Headers/include", "thirdparty/DirectX-Headers/include"}
 
 filter "system:windows"
 systemversion "latest"
